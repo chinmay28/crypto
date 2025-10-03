@@ -143,6 +143,7 @@ func lookupFile(inputFile, password string) error {
 		return err
 	}
 
+	var total int64
 	scanner := bufio.NewScanner(bytes.NewReader(plaintext))
 	for scanner.Scan() {
 		addr := scanner.Text()
@@ -166,8 +167,11 @@ func lookupFile(inputFile, password string) error {
 		}
 
 		balance := ar.ChainStats.Funded - ar.ChainStats.Spent
+		total += balance
 		fmt.Printf("%s %d\n", addr, balance)
 	}
+	fmt.Println("-------------------------------------------")
+	fmt.Printf("Total:\t%d\n", total)
 
 	return scanner.Err()
 }

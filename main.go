@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/crypto/scrypt"
 	"golang.org/x/term"
@@ -146,46 +147,127 @@ func lookupFile(inputFile string, password []byte) (int64, error) {
 	var total int64
 	scanner := bufio.NewScanner(bytes.NewReader(plaintext))
 	for scanner.Scan() {
-		addr := scanner.Text()
-		if addr == "" {
+		line := scanner.Text()
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+
+		parts := strings.Split(line, ",")
+		addr := strings.TrimSpace(parts[0])
+		extras := parts[1:]
 
 		url := fmt.Sprintf("http://pi4:3006/api/address/%s", addr)
 		resp, err := http.Get(url)
 		if err != nil {
-			fmt.Printf("❌ %s ERROR: %v\n", addr, err)
+			fmt.Printf("❌ %s\tERROR: %v\n", addr, err)
 			continue
 		}
+
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		var ar AddrResponse
 		if err := json.Unmarshal(body, &ar); err != nil {
-			fmt.Printf("⚠️ %s ERROR: invalid JSON\n", addr)
+			fmt.Printf("⚠️ %s\tERROR: invalid JSON\n", addr)
 			continue
 		}
 
 		balance := ar.ChainStats.Funded - ar.ChainStats.Spent
 		total += balance
-		fmt.Printf("✅ %s %d\n", addr, balance)
+
+		fmt.Printf("✅ %s\t%d", addr, balance)
+		for _, ex := range extras {
+			fmt.Printf("\t%s", strings.TrimSpace(ex))
+		}
+		fmt.Println()
 	}
-	fmt.Println("-------------------------------------------")
-	fmt.Printf("📊 Total for %s: %d\n\n", inputFile, total)
+
+	fmt.Println("------------------------------------------------")
+	fmt.Printf("💰 Total for %s:\t%d\n\n", inputFile, total)
 
 	return total, scanner.Err()
+}
+
+// --- Helpers for directory walking ---
+func processDir(mode, dir, out string, password []byte) error {
+	var grandTotal int64
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		switch mode {
+		case "encrypt":
+			rel, _ := filepath.Rel(dir, path)
+			outFile := filepath.Join(out, rel+".aes")
+			if err := os.MkdirAll(filepath.Dir(outFile), 0755); err != nil {
+				return err
+			}
+			return encryptFile(path, outFile, password)
+
+		case "decrypt":
+			rel, _ := filepath.Rel(dir, path)
+			base := filepath.Base(path)
+			var outFile string
+			if filepath.Ext(base) == ".aes" {
+				outFile = filepath.Join(out, rel[:len(rel)-4])
+			} else {
+				outFile = filepath.Join(out, rel+".dec")
+			}
+			if err := os.MkdirAll(filepath.Dir(outFile), 0755); err != nil {
+				return err
+			}
+			return decryptFile(path, outFile, password)
+
+		case "lookup":
+			total, err := lookupFile(path, password)
+			if err != nil {
+				fmt.Printf("❌ Error in %s: %v\n", path, err)
+				return nil
+			}
+			grandTotal += total
+		}
+		return nil
+	})
+
+	if mode == "lookup" && err == nil {
+		fmt.Println("===========================================")
+		fmt.Printf("🏦 Grand Total Across All Files: %d\n", grandTotal)
+		fmt.Println("===========================================")
+	}
+
+	return err
 }
 
 // --- main ---
 func main() {
 	mode := flag.String("mode", "", "Mode: encrypt, decrypt, lookup")
-	file := flag.String("file", "", "File to process")
-	dir := flag.String("dir", "", "Directory to process (recursive)")
-	outDir := flag.String("out", "", "Output directory (required for encrypt/decrypt)")
+	file := flag.String("file", "", "Single file to process")
+	dir := flag.String("dir", "", "Directory to process recursively")
+	out := flag.String("out", "", "Output directory (required for encrypt/decrypt)")
 	flag.Parse()
 
 	if *mode == "" {
-		fmt.Println("Usage: crypto -mode [encrypt|decrypt|lookup] -file <file> [-dir <dir>] -out <outdir>")
+		fmt.Println("Usage: crypto -mode [encrypt|decrypt|lookup] -file <file> | -dir <dir> [-out <dir>]")
+		os.Exit(1)
+	}
+
+	if *mode == "encrypt" || *mode == "decrypt" {
+		if *dir == "" {
+			fmt.Println("Error: -dir is required for encrypt/decrypt")
+			os.Exit(1)
+		}
+		if *out == "" {
+			fmt.Println("Error: -out is required for encrypt/decrypt")
+			os.Exit(1)
+		}
+	}
+
+	if *mode == "lookup" && *dir == "" && *file == "" {
+		fmt.Println("Error: -dir or -file required for lookup")
 		os.Exit(1)
 	}
 
@@ -195,98 +277,33 @@ func main() {
 
 	var err error
 	switch *mode {
-	case "encrypt", "decrypt":
-		if *outDir == "" {
-			fmt.Println("Error: -out is required for encrypt/decrypt modes")
-			os.Exit(1)
-		}
-		if err := os.MkdirAll(*outDir, 0755); err != nil {
-			fmt.Println("Error creating output dir:", err)
-			os.Exit(1)
-		}
-
+	case "encrypt", "decrypt", "lookup":
 		if *file != "" {
-			outFile := filepath.Join(*outDir, filepath.Base(*file)+".aes")
-			if *mode == "decrypt" {
+			switch *mode {
+			case "encrypt":
+				err = encryptFile(*file, filepath.Join(*out, filepath.Base(*file)+".aes"), passBytes)
+			case "decrypt":
 				base := filepath.Base(*file)
+				var outFile string
 				if filepath.Ext(base) == ".aes" {
-					outFile = filepath.Join(*outDir, base[:len(base)-4])
+					outFile = filepath.Join(*out, base[:len(base)-4])
 				} else {
-					outFile = filepath.Join(*outDir, base+".dec")
+					outFile = filepath.Join(*out, base+".dec")
 				}
-			}
-			if *mode == "encrypt" {
-				err = encryptFile(*file, outFile, passBytes)
-			} else {
 				err = decryptFile(*file, outFile, passBytes)
+			case "lookup":
+				_, err = lookupFile(*file, passBytes)
 			}
 		} else if *dir != "" {
-			err = filepath.Walk(*dir, func(path string, info os.FileInfo, walkErr error) error {
-				if walkErr != nil {
-					return walkErr
-				}
-				if info.IsDir() {
-					return nil
-				}
-				outFile := filepath.Join(*outDir, filepath.Base(path)+".aes")
-				if *mode == "decrypt" {
-					base := filepath.Base(path)
-					if filepath.Ext(base) == ".aes" {
-						outFile = filepath.Join(*outDir, base[:len(base)-4])
-					} else {
-						outFile = filepath.Join(*outDir, base+".dec")
-					}
-				}
-				if *mode == "encrypt" {
-					return encryptFile(path, outFile, passBytes)
-				}
-				return decryptFile(path, outFile, passBytes)
-			})
-		} else {
-			fmt.Println("Error: Must provide either -file or -dir for encrypt/decrypt")
-			os.Exit(1)
+			err = processDir(*mode, *dir, *out, passBytes)
 		}
-
-	case "lookup":
-		if *file != "" {
-			var total int64
-			total, err = lookupFile(*file, passBytes)
-			if err == nil {
-				fmt.Printf("📊 Final Total: %d\n", total)
-			}
-		} else if *dir != "" {
-			var grandTotal int64
-			err = filepath.Walk(*dir, func(path string, info os.FileInfo, walkErr error) error {
-				if walkErr != nil {
-					return walkErr
-				}
-				if info.IsDir() {
-					return nil
-				}
-				total, err := lookupFile(path, passBytes)
-				if err != nil {
-					return err
-				}
-				grandTotal += total
-				return nil
-			})
-			if err == nil {
-				fmt.Println("===========================================")
-				fmt.Printf("🏦 Grand Total Across All Files: %d\n", grandTotal)
-			        fmt.Println("===========================================")
-			}
-		} else {
-			fmt.Println("Error: Must provide either -file or -dir for lookup")
-			os.Exit(1)
-		}
-
 	default:
 		fmt.Println("Invalid mode. Use encrypt, decrypt, or lookup.")
 		os.Exit(1)
 	}
 
 	if err != nil {
-		fmt.Println("Error:", err)
+		fmt.Println("❌ Error:", err)
 		os.Exit(1)
 	}
 }

@@ -95,7 +95,7 @@ Or process an entire directory recursively:
 - Tab-separated output for readability:
 
 ```
-✅ wspcdl56    1847800    52464
+✅ wspcdl567712    1842672    5246428
 ```
 
 ---
